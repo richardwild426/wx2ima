@@ -1,0 +1,54 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Cloudflare local state and credentials
+.wrangler/
+.dev.vars*
+.env.*
+*.pem
+*.key
+
+# Per-deployment configuration, local data, and credentials
+wrangler.jsonc
+wrangler.local.*
+*.log
+*.sqlite*
+*.db
+*.db-*
+*.pdf
+*.p12
+*.pfx
+*.bak
+*.backup

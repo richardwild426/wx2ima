@@ -1,0 +1,157 @@
+# wx2ima
+
+输入微信公众号文章链接，一键将文章保存为 PDF 并上传到 IMA 知识库。
+
+网站采用简体中文界面，支持访问口令、多份 IMA 凭据、公众号自动分配、待分类知识库和失败重试。首次配置完成后，日常只需选择 IMA 账号并提供文章链接。
+
+## 主要功能
+
+- **访问口令**：使用共享口令登录，凭据在服务端加密保存。
+- **多个 IMA 账号**：展示账号备注、用户自填的用户名、凭据指纹和可写知识库数量；支持修改、删除和重新连接。
+- **自动分配**：每个账号分别配置公众号与知识库的对应关系，未匹配的文章进入该账号指定的待分类知识库。
+- **自动保存**：调用长风工具箱 MCP 获取文章和 PDF，校验后归档到私有 R2，再上传并核验 IMA 条目。
+- **导入历史**：查看进度、结果和错误，下载已归档的 PDF，重试失败任务。
+- **防止重复操作**：按钮显示加载动画和中文提示，请求期间禁用重复提交；文章按账号和目标知识库进行去重。
+
+IMA 公开接口目前不提供可核验的昵称或头像。因此，页面显示的用户名由用户自行填写，凭据指纹用于区分 Client ID，不代表经过 IMA 核验的用户身份。
+
+## 使用流程
+
+1. 使用网站访问口令登录。
+2. 在 [IMA 开放接口页面](https://ima.qq.com/agent-interface) 获取 Client ID 和 API key，在网站中添加账号。
+3. 填写账号备注和用户名，选择一个已有且可写的知识库作为待分类目标。
+4. 按需配置公众号名称与知识库的对应关系。
+5. 选择账号，粘贴微信公众号文章链接并提交。每次最多提交 10 条链接。
+
+导入在后台执行，关闭页面不会主动取消任务。浏览器会记住所选账号。更改分配规则只影响后续分配，不会移动已经导入的文章。
+
+## 部署到 Cloudflare
+
+### 环境要求
+
+- Bun。
+- 已登录并具有相应资源权限的 Cloudflare Wrangler。
+- Cloudflare Workers、Workflows、D1 和 R2。
+- 一个由 Cloudflare 管理的域名及相应 DNS 记录。
+
+本项目使用静态 HTML、CSS 和 JavaScript，不需要启动前端开发服务器或执行前端构建。部署由 Wrangler 完成。
+
+### 1. 安装依赖并创建配置
+
+```sh
+bun install --frozen-lockfile
+cp wrangler.example.jsonc wrangler.jsonc
+bunx wrangler login
+```
+
+`wrangler.jsonc` 是本地部署配置，已被 Git 忽略。请按实际资源修改模板中的域名、数据库 ID 和存储桶名称；多账号环境可在本地配置中添加 `account_id`。
+
+### 2. 创建存储资源
+
+```sh
+bunx wrangler d1 create wx2ima
+bunx wrangler r2 bucket create YOUR_BUCKET_NAME
+```
+
+将 D1 返回的数据库 ID 写入配置中的 `d1_databases[0].database_id`，将实际存储桶名称写入 `r2_buckets[0].bucket_name`。如果修改数据库名称，也需同步修改 `package.json` 中的 `migrate` 命令。
+
+配置 `routes` 的域名和区域，并把 `vars.APP_ORIGIN` 设置为网站完整 HTTPS 地址。该地址必须与实际访问地址一致，否则登录和写入请求会被来源校验拒绝。模板通过 Worker 路由接入已有的代理 DNS 记录，请先在 Cloudflare 配置相应记录。
+
+### 3. 校验并发布
+
+```sh
+bun run check
+bun run lint
+bun test
+bun run migrate
+bun run deploy
+```
+
+Wrangler 会发布 Worker、静态资源和 Workflow 绑定。模板关闭了 `workers.dev` 和预览地址，网站通过配置的域名访问。
+
+### 4. 初始化加密和访问口令
+
+```sh
+bun scripts/prepare-encryption.ts
+bun scripts/set-password.ts
+```
+
+加密初始化脚本只检查 Cloudflare 中的密钥名称；仅在 `ENCRYPTION_KEY` 不存在时生成并上传随机密钥，不会读取或替换已有密钥。保持该密钥稳定，否则已有 IMA 凭据将无法解密。
+
+口令脚本通过终端隐藏输入，要求 12–256 个字符且首尾无空格。脚本在本地计算加盐校验值，仅把校验值写入 Cloudflare 的 `ACCESS_PASSWORD_HASH`。修改口令会使现有登录会话失效。
+
+完成后打开配置的域名，在网站中添加 IMA 凭据。不要把口令、API key 或加密密钥写入源码、配置模板或提交记录。
+
+### 后续更新
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run lint
+bun test
+bun run migrate
+bun run deploy
+```
+
+保留本地部署配置和 Cloudflare 中已有的密钥；更新代码无需重新初始化加密或重设口令。
+
+## 账号修改与删除
+
+账号备注和用户名可以直接修改，无需重新填写凭据。更换 API key 时需要同时填写 Client ID 和 API key，且 Client ID 必须属于原账号；不同 Client ID 应作为新账号添加。新凭据会先验证，并确认仍能访问已配置的知识库。
+
+删除操作需在网页中确认。删除后清除网站保存的凭据、公众号规则和待分类配置，保留导入历史、PDF、去重记录及已经上传到 IMA 的内容。有历史记录的已删除账号会显示在历史分组中，只能浏览记录和下载 PDF。
+
+使用同一 Client ID 重新连接会恢复原账号身份和去重历史，但需重新配置分配规则。存在进行中的导入任务时，不能删除账号或替换凭据。
+
+## PDF 命名、去重与重试
+
+新 PDF 默认命名为 `日期_文章标题.pdf`，不添加文章哈希或任务 ID。非法路径字符会被清理，过长标题会被截断。重名时使用 `（2）`、`（3）` 等序号，同时检查 IMA 已有名称和网站任务中已占用的名称。最多尝试 100 个候选名称，超过后提示整理目标知识库并重试。
+
+上传到 IMA 的标题、文件名和网站下载文件名保持一致。历史已上传条目不会自动改名。R2 内部对象路径与展示文件名分离，避免同名文件互相覆盖。
+
+文章去重依据文章身份、IMA 账号和目标知识库，核验依据 IMA 媒体 ID，不把文件名相同视为文章相同。失败任务复用已归档的 PDF 和已成功上传的对象。若添加条目的响应丢失，系统会先核验原媒体 ID，不盲目再次添加；无法确定结果时保留可重试状态。
+
+## 权限与安全
+
+这是一个**共享工作区**：持有访问口令的用户拥有相同权限，可以管理全部账号、配置分配规则、查看历史和下载 PDF。目前没有独立用户角色或私人账号隔离。
+
+- IMA 凭据使用 AES-256-GCM 加密，接口和页面不返回原始凭据。
+- 会话令牌仅在服务端保存哈希，Cookie 使用 Secure、HttpOnly、SameSite=Strict，有效期为七天。
+- 登录和导入有限流，写入请求校验来源与 JSON 类型。
+- PDF 保存在私有 R2 存储桶，下载需要有效登录会话。
+- 本地部署配置、环境文件、私钥、Cloudflare 本地状态和日志不提交到仓库。
+
+## 范围与限制
+
+- 仅支持 `https://mp.weixin.qq.com/s/...` 和包含完整文章参数的 `/s?__biz=...&mid=...&idx=...&sn=...` 链接，不支持合集。
+- 长风 MCP 同时返回 HTML 元数据和 PDF，只将 PDF 上传到 IMA，不自动降级为 HTML 或 Markdown。
+- 单个 PDF 上限为 16 MiB，会校验文件签名、可解析性、加密情况和页数。
+- 公众号优先按可用标识匹配；仅能获取名称时使用精确名称匹配，同名公众号和改名需要人工调整规则。
+- PDF 排版与文字质量取决于上游转换服务。图片式 PDF 可能需要 OCR；保存成功只表示知识条目已核验，不表示 IMA 已完成索引或 OCR。
+- 页面展示每个账号最近 100 条导入记录，站点最多同时接纳 20 个进行中的任务。
+- 部署配置不自动开通付费套餐；实际运行受 Cloudflare 账户套餐和平台限制。复杂 PDF 可能超出运行资源，失败任务可在历史中查看和重试。
+
+## 项目结构
+
+```text
+public/                  中文网页、样式和浏览器交互
+src/                     Worker 接口、工作流、凭据和提供方集成
+migrations/              D1 数据库迁移
+scripts/                 加密初始化和访问口令配置
+tests/                   自动化测试与模拟提供方响应
+docs/verification.md     脱敏验证记录
+wrangler.example.jsonc   可提交的部署配置模板
+```
+
+## 验证
+
+`bun test` 使用内存 SQLite 和模拟服务响应，不使用真实 IMA 凭据。测试覆盖登录、加密存储、账号修改与删除、并发保护、文章与下载地址校验、PDF 校验、分配规则、去重、重名、上传失败与不确定响应恢复。
+
+已完成真实环境下的文章转换、PDF 归档、IMA 上传和去重验证。公开记录不包含账号、知识库名称、生产资源 ID 或真实凭据，详见 [验证记录](docs/verification.md)。
+
+## 参考
+
+- [原始流程参考：wx-article-sync](https://github.com/richardwild426/wx-article-sync)
+- [长风工具箱微信文章服务](https://changfengbox.top/wechat)
+- [IMA 凭据与官方技能入口](https://ima.qq.com/agent-interface)
+- [Cloudflare Workflows 文档](https://developers.cloudflare.com/workflows/)
