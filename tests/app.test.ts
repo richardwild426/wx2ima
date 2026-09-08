@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { PDFDocument } from "pdf-lib";
+import { cleanupExpiredPdfs } from "../src/retention";
 import {
   createSession,
   decrypt,
@@ -218,8 +219,8 @@ async function workflowFixture() {
       return callback();
     },
   };
-  async function run() {
-    return workflow.run({ payload: { jobId: "job" } } as never, step as never);
+  async function run(jobId = "job") {
+    return workflow.run({ payload: { jobId } } as never, step as never);
   }
   return {
     env,
@@ -249,6 +250,10 @@ test("full import uses Unsorted, archives PDF and verifies the IMA entry", async
   };
   expect(job.stage).toBe("complete");
   expect(job.used_inbox).toBe(1);
+  expect(
+    (f.db.prepare("SELECT completed_at FROM jobs WHERE id='job'").get() as Job)
+      .completed_at,
+  ).not.toBeNull();
   expect(job.file_name).toMatch(/^\d{4}-\d{2}-\d{2}_An article\.pdf$/);
   expect(f.objects.size).toBe(1);
   expect(f.counts()).toEqual({ creates: 1, adds: 1 });
@@ -1465,4 +1470,58 @@ describe("profile verification and concurrent changes", () => {
     expect(f.snapshot().objects).toEqual(before.objects);
     expect(f.remote).toHaveBeenCalledTimes(2);
   });
+});
+
+test("scheduled cleanup preserves history and expired downloads return authenticated HTTP 410", async () => {
+  const f = await profileFixture();
+  f.db
+    .prepare("UPDATE jobs SET completed_at='2020-01-01 00:00:00' WHERE id=?")
+    .run(completedJob);
+  const imports = f.snapshot().imports;
+  await app.scheduled({} as ScheduledController, f.env);
+  expect(f.objects.size).toBe(0);
+  expect(f.snapshot().imports).toEqual(imports);
+  const detail = await f.request(`/api/jobs/${completedJob}`);
+  expect(((await detail.json()) as { job: PublicJob }).job).toMatchObject({
+    has_pdf: false,
+    stage: "complete",
+  });
+  const download = await f.request(`/api/jobs/${completedJob}/pdf`);
+  expect(download.status).toBe(410);
+  expect(await download.text()).toContain("备份已过期");
+  expect(
+    (
+      await f.request(`/api/jobs/${completedJob}/pdf`, "GET", undefined, {
+        Cookie: "",
+      })
+    ).status,
+  ).toBe(401);
+  expect(f.remote).not.toHaveBeenCalled();
+});
+
+test("expired R2 archives do not cause another IMA upload when the same article is submitted again", async () => {
+  const f = await workflowFixture();
+  await f.run();
+  f.db
+    .prepare(
+      "UPDATE jobs SET completed_at='2020-01-01 00:00:00' WHERE id='job'",
+    )
+    .run();
+  const ledger = f.db.prepare("SELECT * FROM imports").all();
+  await cleanupExpiredPdfs(f.env);
+  expect(f.objects.size).toBe(0);
+  f.db
+    .prepare(
+      "INSERT INTO jobs(id,profile_id,source_url,url_hash) VALUES ('b','account','https://mp.weixin.qq.com/s/abc','hash')",
+    )
+    .run();
+  await f.run("b");
+  expect(f.counts()).toEqual({ creates: 1, adds: 1 });
+  const duplicate = f.db
+    .prepare("SELECT * FROM jobs WHERE id='b'")
+    .get() as Job;
+  expect(duplicate.stage).toBe("duplicate");
+  expect(duplicate.completed_at).not.toBeNull();
+  expect(f.db.prepare("SELECT * FROM imports").all()).toEqual(ledger);
+  expect(f.objects.size).toBe(1);
 });

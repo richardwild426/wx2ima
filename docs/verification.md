@@ -4,7 +4,7 @@ This record omits deployment identifiers, domains, account details, knowledge-ba
 
 ## Automated verification
 
-Type checking, linting, and 82 tests (1,114 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
+Type checking, linting, and 92 tests (1,194 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
 
 Coverage includes:
 
@@ -38,3 +38,11 @@ No completed live account edit/delete flow is claimed. Those paths were checked 
 The tested PDF included image-based text and imperfect page breaks. Verified IMA entry creation does not imply completed OCR or indexing. A successful sample is not a guarantee for larger or more complex PDFs under a deployment's Cloudflare resource limits.
 
 Previously uploaded IMA entries retain their original filenames. New imports use readable names without article-hash or job-ID suffixes.
+
+## One-year PDF retention
+
+- Confirmed complete and duplicate jobs retain their R2 backup for 365 days after verification. Failed, uncertain, active, and unverified jobs are excluded. Legacy verified terminal jobs use their previous update timestamp as the completion timestamp.
+- The Worker has a daily 19:00 UTC (03:00 Asia/Shanghai) scheduled handler. Each run processes at most 20 due archives, leaving excess work for later runs. It deletes R2 objects before marking the records, preserves import history and deduplication claims, and never deletes IMA content or requires account credentials.
+- Tests cover the exact expiry boundary, late verification of old jobs, protected states, deleted accounts, R2 failure isolation, D1 failure reconciliation after deletion, overlapping invocations, bounded batches, migration backfill, authenticated HTTP 410 responses, and repeat submissions after archive expiry without another IMA upload.
+- Frontend interaction simulation covered expired, retained, unknown-expiry, and invalid-expiry records. Expired backups have no download link; retained backups include the expiry date in their download hint when known.
+- The production migration completed without deleting objects. Existing records were below the retention age. Automated tests exercised the scheduled handler; no live expired-object deletion is claimed for this release.

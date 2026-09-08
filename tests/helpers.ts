@@ -22,7 +22,7 @@ Object.assign(globalThis, {
     }
   },
 });
-export function testEnv() {
+export function testEnv({ applyRetentionMigration = true } = {}) {
   const db = new Database(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(
@@ -43,6 +43,13 @@ export function testEnv() {
       "utf8",
     ),
   );
+  if (applyRetentionMigration)
+    db.exec(
+      readFileSync(
+        new URL("../migrations/0004_pdf_retention.sql", import.meta.url),
+        "utf8",
+      ),
+    );
   function prepare(sql: string) {
     let bindings: unknown[] = [];
     function execute() {
@@ -79,6 +86,9 @@ export function testEnv() {
       },
     },
     PDFS: {
+      async delete(key: string) {
+        objects.delete(key);
+      },
       async put(key: string, value: Uint8Array) {
         objects.set(key, new Uint8Array(value));
       },

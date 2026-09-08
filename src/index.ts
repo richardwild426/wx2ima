@@ -6,6 +6,7 @@ import {
   editProfile,
   inputText as text,
 } from "./profiles";
+import { cleanupExpiredPdfs } from "./retention";
 import {
   checkOrigin,
   createSession,
@@ -293,6 +294,11 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   if (jobRoute) {
     const job = await jobById(env, jobRoute[1] as string);
     if (jobRoute[2] === "pdf" && request.method === "GET") {
+      if (job.pdf_deleted_at)
+        throw new AppError(
+          "备份已过期，网站中的 PDF 已清理；IMA 中的内容不受影响。",
+          410,
+        );
       if (!job.object_key) throw new AppError("此导入任务尚未保存 PDF。", 404);
       const file = await env.PDFS.get(job.object_key);
       if (!file) throw new AppError("未找到已保存的 PDF。", 404);
@@ -338,6 +344,9 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   throw new AppError("未找到请求的资源。", 404);
 }
 export default {
+  async scheduled(_controller: ScheduledController, env: Env) {
+    await cleanupExpiredPdfs(env);
+  },
   async fetch(request: Request, env: Env): Promise<Response> {
     let response: Response;
     try {

@@ -1,3 +1,4 @@
+import { pdfExpiresAt } from "./retention";
 import { AppError, type Env, type Job, type Profile } from "./types";
 export async function profile(env: Env, id: string) {
   const p = await env.DB.prepare("SELECT * FROM profiles WHERE id = ?")
@@ -38,6 +39,7 @@ const fields = new Set([
   "error",
   "workflow_id",
   "attempts",
+  "completed_at",
 ]);
 export async function updateJob(env: Env, id: string, values: Partial<Job>) {
   const entries = Object.entries(values).filter(([k]) => fields.has(k));
@@ -98,6 +100,8 @@ export function publicJob(j: Job) {
     updated_at,
     source_url,
     account_key,
-    has_pdf: !!j.object_key,
+    has_pdf: !!j.object_key && !j.pdf_deleted_at,
+    pdf_deleted_at: j.pdf_deleted_at ?? null,
+    pdf_expires_at: pdfExpiresAt(j),
   };
 }

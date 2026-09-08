@@ -281,7 +281,7 @@ function updateDestination() {
     !profile?.inbox_id;
   $("route-summary").textContent = profile
     ? profile.deleted_at
-      ? "账号已删除，仅可查看记录和下载 PDF"
+      ? "账号已删除，仅可查看记录和下载仍保留的 PDF"
       : state.profileBusy.has(profile.id)
         ? "账号正在更新，请稍候"
         : profile.inbox_name
@@ -515,10 +515,25 @@ function renderHistory() {
     if (j.error) status.append(node("p", "status-error", j.error));
     row.append(status);
     const actions = node("div", "row-actions");
-    if (j.has_pdf) {
+    if (j.pdf_deleted_at) {
+      actions.append(node("span", "small-note", "备份已过期"));
+    } else if (j.has_pdf) {
       const pdf = node("a", "", "PDF ↓");
       pdf.href = `/api/jobs/${j.id}/pdf`;
       pdf.setAttribute("download", "");
+      let downloadHint = "下载 PDF";
+      if (j.pdf_expires_at) {
+        const expires = new Date(j.pdf_expires_at);
+        if (!Number.isNaN(expires.getTime()))
+          downloadHint += ` · 备份保留至 ${expires.toLocaleDateString("zh-CN", {
+            timeZone: "Asia/Shanghai",
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          })}（北京时间）`;
+      }
+      pdf.title = downloadHint;
+      pdf.setAttribute("aria-label", downloadHint);
       actions.append(pdf);
     }
     if (j.stage === "failed" && writableProfile(j.profile_id))

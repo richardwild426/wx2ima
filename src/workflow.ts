@@ -131,6 +131,9 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
                 await updateJob(this.env, id, {
                   stage: "duplicate",
                   media_id: existing.media_id,
+                  completed_at:
+                    current.completed_at ??
+                    new Date().toISOString().slice(0, 19).replace("T", " "),
                 });
                 return true;
               }
@@ -305,7 +308,7 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
               id,
             ),
             this.env.DB.prepare(
-              "UPDATE jobs SET stage='complete',error=NULL,updated_at=datetime('now') WHERE id=?",
+              "UPDATE jobs SET stage='complete',error=NULL,completed_at=COALESCE(completed_at,datetime('now')),updated_at=datetime('now') WHERE id=?",
             ).bind(id),
           ]);
         },
