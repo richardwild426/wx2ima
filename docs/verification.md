@@ -4,7 +4,7 @@ This record omits deployment identifiers, domains, account details, knowledge-ba
 
 ## Automated verification
 
-Type checking, linting, and 92 tests (1,194 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
+Type checking, linting, and 158 tests (1,292 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
 
 Coverage includes:
 
@@ -46,3 +46,10 @@ Previously uploaded IMA entries retain their original filenames. New imports use
 - Tests cover the exact expiry boundary, late verification of old jobs, protected states, deleted accounts, R2 failure isolation, D1 failure reconciliation after deletion, overlapping invocations, bounded batches, migration backfill, authenticated HTTP 410 responses, and repeat submissions after archive expiry without another IMA upload.
 - Frontend interaction simulation covered expired, retained, unknown-expiry, and invalid-expiry records. Expired backups have no download link; retained backups include the expiry date in their download hint when known.
 - The production migration completed without deleting objects. Existing records were below the retention age. Automated tests exercised the scheduled handler; no live expired-object deletion is claimed for this release.
+
+## Publication-date filenames
+
+- New filenames use the article's publication day in Asia/Shanghai, persisted independently of job creation and completion timestamps. Collisions and retries reuse that day. Missing, invalid, incomplete, or conflicting publication signals produce an explicit unknown-publication-date filename instead of substituting the upload date.
+- A live public article's converted HTML contained a Chinese date in `#publish_time` and a second empty placeholder. Parsing the actual response returned its correct publication day. Fixtures cover that structure, explicit publication metadata, Unix seconds, timezone boundaries, invalid calendar dates, and exclusion of prose, modification dates, and download dates.
+- Workflow tests cover an older article imported today, collisions and retries retaining its publication date, unknown dates remaining unknown, and metadata refresh for a legacy archive without another PDF download. Already uploaded media retains its existing name when reconciling an ambiguous IMA write.
+- The publication date does not shorten the 365-day retention period, which still starts at successful IMA verification. Existing uploaded entries are not renamed. This release did not perform an additional real IMA upload.

@@ -36,11 +36,7 @@ export function articleIdentity(url: string) {
     idx = u.searchParams.get("idx");
   return biz && mid && idx ? `wx:${biz}:${mid}:${idx}` : null;
 }
-export function fileName(
-  title: string,
-  date = new Date().toISOString().slice(0, 10),
-  copy = 1,
-) {
+export function fileName(title: string, date: string | null = null, copy = 1) {
   const clean =
     [...title]
       .filter((char) => (char.codePointAt(0) ?? 0) >= 32)
@@ -53,7 +49,7 @@ export function fileName(
     if (new TextEncoder().encode(clipped + char).length > 160) break;
     clipped += char;
   }
-  return `${date}_${clipped}${copy > 1 ? `（${copy}）` : ""}.pdf`;
+  return `${date || "发布日期未知"}_${clipped}${copy > 1 ? `（${copy}）` : ""}.pdf`;
 }
 export function assertPublicDownload(value: string) {
   const url = new URL(value);

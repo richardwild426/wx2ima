@@ -238,6 +238,203 @@ function decodeAttribute(value: string): string {
     },
   );
 }
+/** Validate calendar fields before conversion: Date.parse silently rolls invalid days forward. */
+function normalizePublishedDate(raw: string): string | null {
+  const value = decodeAttribute(raw).trim();
+  const beijingDay = (milliseconds: number): string | null => {
+    const date = new Date(milliseconds + 8 * 60 * 60 * 1000);
+    return Number.isFinite(date.getTime()) &&
+      date.getUTCFullYear() > 0 &&
+      date.getUTCFullYear() <= 9999
+      ? date.toISOString().slice(0, 10)
+      : null;
+  };
+  // Only Unix seconds are accepted; millisecond timestamps and partial years are ambiguous.
+  if (/^\d{10}$/.test(value)) return beijingDay(Number(value) * 1000);
+  const normalized = value.replace(
+    /^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/,
+    "$1-$2-$3",
+  );
+  const match = normalized.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s]+(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?\s*(Z|[+-]\d{2}:?\d{2})?)?$/i,
+  );
+  if (!match) return null;
+  const [, y, m, d, h, min, sec, fraction, zone] = match;
+  const year = Number(y);
+  const month = Number(m);
+  const day = Number(d);
+  const hour = Number(h ?? 0);
+  const minute = Number(min ?? 0);
+  const second = Number(sec ?? 0);
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(
+    hour,
+    minute,
+    second,
+    Number((fraction ?? "").padEnd(3, "0")),
+  );
+  if (
+    year < 1 ||
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  )
+    return null;
+  // Unzoned article dates are Beijing wall time, independent of the server's timezone.
+  let offset = 8 * 60;
+  if (zone?.toUpperCase() === "Z") offset = 0;
+  else if (zone) {
+    if (zone === "-00:00" || zone === "-0000") return null;
+    const digits = zone.slice(1).replace(":", "");
+    const hours = Number(digits.slice(0, 2));
+    const minutes = Number(digits.slice(2));
+    if (hours > 14 || minutes > 59 || (hours === 14 && minutes !== 0))
+      return null;
+    offset = (hours * 60 + minutes) * (zone.startsWith("-") ? -1 : 1);
+  }
+  return beijingDay(date.getTime() - offset * 60 * 1000);
+}
+
+/** Only inspect article JSON-LD nodes, never dates of nested comments or related content. */
+function jsonPublicationDates(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(jsonPublicationDates);
+  if (!value || typeof value !== "object") return [];
+  const node = value as Record<string, unknown>;
+  const types = Array.isArray(node["@type"]) ? node["@type"] : [node["@type"]];
+  const dates =
+    types.some(
+      (type) =>
+        typeof type === "string" &&
+        /^(?:https?:\/\/schema\.org\/)?(?:Article|NewsArticle|BlogPosting)$/.test(
+          type,
+        ),
+    ) && typeof node.datePublished === "string"
+      ? [node.datePublished]
+      : [];
+  return dates.concat(jsonPublicationDates(node["@graph"]));
+}
+
+/** Recognize WeChat's literal top-level ct declaration without executing provider scripts. */
+function wechatPublicationDates(script: string): string[] {
+  const tokens =
+    script
+      .match(
+        /\/\*[\s\S]*?\*\/|\/\/[^\n\r]*|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`|[\w$]+|[^\s]/g,
+      )
+      ?.filter((token) => !token.startsWith("//") && !token.startsWith("/*")) ??
+    [];
+  const dates: string[] = [];
+  let depth = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i] ?? "";
+    if (["{", "(", "["].includes(token)) depth++;
+    if (["}", ")", "]"].includes(token)) depth--;
+    if (
+      depth !== 0 ||
+      !["var", "let", "const"].includes(token) ||
+      tokens[i + 1] !== "ct" ||
+      tokens[i + 2] !== "="
+    )
+      continue;
+    const raw = tokens[i + 3] ?? "";
+    let end = i + 4;
+    if (tokens[end] === "*" && tokens[end + 1] === "1") end += 2;
+    if (end < tokens.length && tokens[end] !== ";") continue;
+    dates.push(raw.replace(/^(["'])(.*)\1$/, "$2"));
+  }
+  return dates;
+}
+
+/**
+ * Collect explicit publication signals outside article prose. Empty provider placeholders
+ * are absent; malformed nonempty signals or disagreements must not invent a publication day.
+ * Document text callbacks accumulate split text chunks exactly once, including nested spans.
+ */
+function publicationCollector(rewriter: HTMLRewriter): () => string | null {
+  const dates: string[] = [];
+  const captures = new Set<{ text: string }>();
+  let ignored = 0;
+  rewriter
+    .on("*", {
+      element(e) {
+        if (
+          e.getAttribute("id") === "js_content" ||
+          ["pre", "code", "template", "noscript"].includes(e.tagName)
+        ) {
+          ignored++;
+          e.onEndTag(() => {
+            ignored--;
+          });
+        }
+        if (ignored) return;
+        const published =
+          e.getAttribute("id") === "publish_time" ||
+          (e.getAttribute("itemprop") ?? "")
+            .split(/\s+/)
+            .includes("datePublished") ||
+          (e.tagName === "meta" &&
+            ["article:published_time", "datepublished"].includes(
+              (
+                e.getAttribute("property") ??
+                e.getAttribute("name") ??
+                ""
+              ).toLowerCase(),
+            ));
+        if (published) {
+          const attribute =
+            e.getAttribute("content") ?? e.getAttribute("datetime");
+          if (attribute !== null) dates.push(attribute);
+          else if (e.tagName !== "meta") {
+            const capture = { text: "" };
+            captures.add(capture);
+            e.onEndTag(() => {
+              dates.push(capture.text);
+              captures.delete(capture);
+            });
+          }
+        }
+        if (e.tagName === "script" && !e.getAttribute("src")) {
+          const type = (e.getAttribute("type") ?? "").trim().toLowerCase();
+          if (
+            ![
+              "",
+              "text/javascript",
+              "application/javascript",
+              "application/ld+json",
+            ].includes(type)
+          )
+            return;
+          const capture = { text: "" };
+          captures.add(capture);
+          e.onEndTag(() => {
+            captures.delete(capture);
+            if (type === "application/ld+json") {
+              try {
+                dates.push(...jsonPublicationDates(JSON.parse(capture.text)));
+              } catch {
+                /* Malformed JSON is not a publication signal. */
+              }
+            } else dates.push(...wechatPublicationDates(capture.text));
+          });
+        }
+      },
+    })
+    .onDocument({
+      text(t) {
+        if (!ignored) for (const capture of captures) capture.text += t.text;
+      },
+    });
+  return () => {
+    const nonempty = dates.filter((date) => decodeAttribute(date).trim());
+    const days = new Set(nonempty.map(normalizePublishedDate));
+    return days.size === 1 ? (days.values().next().value ?? null) : null;
+  };
+}
+
 /** The provider strips some WeChat metadata. Only use account IDs when actually present. */
 export async function metadata(html: Uint8Array, sourceUrl: string) {
   const values: {
@@ -267,6 +464,7 @@ export async function metadata(html: Uint8Array, sourceUrl: string) {
         values.date += t.text;
       },
     });
+  const publishedDate = publicationCollector(rewriter);
   await rewriter.transform(new Response(new TextDecoder().decode(html))).text();
   const text = new TextDecoder().decode(html);
   values.publisher = values.publisher.trim();
@@ -323,5 +521,5 @@ export async function metadata(html: Uint8Array, sourceUrl: string) {
   const identity =
     articleIdentity(sourceUrl) ||
     (values.canonical ? articleIdentity(values.canonical) : null);
-  return { ...values, accountKey, identity };
+  return { ...values, publishedDate: publishedDate(), accountKey, identity };
 }

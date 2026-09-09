@@ -183,6 +183,143 @@ describe("provider contract", () => {
     expect(readLimited(new Response(stream), 16)).rejects.toThrow("大小限制");
   });
 });
+describe("article publication dates", () => {
+  async function publishedDate(fragment: string) {
+    const result = await metadata(
+      new TextEncoder().encode(
+        `<meta property="og:title" content="Publication fixture">${fragment}`,
+      ),
+      "https://mp.weixin.qq.com/s/publication-fixture",
+    );
+    return result.publishedDate;
+  }
+
+  test("normalizes the real provider's Chinese date and empty duplicate placeholder", async () => {
+    expect(
+      await publishedDate(`
+      <em class="rich_media_meta rich_media_meta_text" id="publish_time">
+        2026年07月01日 06:56
+      </em>
+      <em class="rich_media_meta rich_media_meta_text" id="publish_time"> </em>
+    `),
+    ).toBe("2026-07-01");
+  });
+
+  test.each([
+    ["2026-7-1", "2026-07-01"],
+    ["2026年7月1日", "2026-07-01"],
+    ["2024年2月29日 23:59:59", "2024-02-29"],
+    ["2026-07-01 23:59", "2026-07-01"],
+    ["2026-07-01T16:30:00Z", "2026-07-02"],
+    ["2026-01-01T00:30:00+14:00", "2025-12-31"],
+    ["2026-12-31T23:59:59.123-0500", "2027-01-01"],
+    ["2026-07-01T00:30:00+08:00", "2026-07-01"],
+    ["1782921600", "2026-07-02"],
+  ])("normalizes %s to Beijing day %s", async (input, expected) => {
+    expect(await publishedDate(`<em id="publish_time">${input}</em>`)).toBe(
+      expected,
+    );
+  });
+
+  test.each([
+    "",
+    " ",
+    "2026",
+    "2026-07",
+    "07-01",
+    "7月1日",
+    "昨天 06:56",
+    "2026-02-29",
+    "2024-02-30",
+    "2026-04-31",
+    "2026-00-01",
+    "2026-13-01",
+    "2026-07-00",
+    "0000-01-01",
+    "2026-07-01 24:00",
+    "2026-07-01 12:60",
+    "2026-07-01T12:30:60Z",
+    "2026-07-01T12:30:00+14:01",
+    "2026-07-01T12:30:00+08:60",
+    "2026-07-01T12:30:00+25:00",
+    "2026-07-01T12:30:00-00:00",
+    "1782921600000",
+    "NaN",
+    "Published on 2026-07-01; downloaded 2026-09-09",
+  ])("rejects incomplete or invalid publication value %j", async (input) => {
+    expect(
+      await publishedDate(`<em id="publish_time">${input}</em>`),
+    ).toBeNull();
+  });
+
+  test.each([
+    '<meta property="article:published_time" content="2026-07-01T16:30:00Z">',
+    '<meta name="datePublished" content="2026-07-02">',
+    '<meta itemprop="datePublished" content="2026-07-02">',
+    '<time itemprop="datePublished" datetime="2026-07-01T16:30:00Z">July 2</time>',
+    '<span itemprop="datePublished"><b>2026年</b>7月2日&nbsp;06:56</span>',
+    '<em id="publish_time">2026&#24180;07&#26376;02&#26085;</em>',
+    '<script>var ct = "1782921600";</script>',
+    "<script>var ct = '1782921600' * 1;</script>",
+    "<script>const ct = 1782921600;</script>",
+    '<script type="application/ld+json">{"@type":"NewsArticle","datePublished":"2026-07-02","dateModified":"2026-09-09"}</script>',
+    '<script type="application/ld+json">{"@graph":[{"@type":"WebSite","datePublished":"2020-01-01"},{"@type":["Article"],"datePublished":"2026-07-02","comment":{"datePublished":"2026-09-09"}}]}</script>',
+  ])("accepts explicit publication metadata: %s", async (fragment) => {
+    expect(await publishedDate(fragment)).toBe("2026-07-02");
+  });
+
+  test.each([
+    "",
+    '<p>Publication date: 2026-07-01</p><time datetime="2026-07-01">2026-07-01</time>',
+    '<meta property="article:modified_time" content="2026-07-01"><meta name="date" content="2026-07-01"><time itemprop="dateModified">2026-07-01</time>',
+    "<p>Downloaded: 2026-09-09</p><script>var download_time = 1782921600; var modify_time = 1782921600;</script>",
+    '<div id="js_content"><em id="publish_time">2026-07-01</em><meta itemprop="datePublished" content="2026-07-01"><script>var ct = 1782921600;</script></div>',
+    '<pre>var ct = 1782921600;</pre><code><time itemprop="datePublished">2026-07-01</time></code>',
+    '<script>// var ct = 1782921600;\n/* var ct = 1782921600; */ const example = "var ct = 1782921600;";</script>',
+    "<script>const nested = {ct: 1782921600}; function example() { var ct = 1782921600; }</script>",
+    '<script type="application/json">{"ct":1782921600,"datePublished":"2026-07-01"}</script>',
+    '<script type="application/ld+json">{"@type":"Comment","datePublished":"2026-07-01"}</script>',
+    '<script type="application/ld+json">{invalid json}</script>',
+  ])(
+    "ignores absent, body, modification and download dates: %s",
+    async (fragment) => {
+      expect(await publishedDate(fragment)).toBeNull();
+    },
+  );
+
+  test("compares independent signals after Beijing conversion", async () => {
+    expect(
+      await publishedDate(
+        '<em id="publish_time">2026-07-02</em><meta property="article:published_time" content="2026-07-01T16:30:00Z"><script>var ct = 1782921600;</script>',
+      ),
+    ).toBe("2026-07-02");
+    expect(
+      await publishedDate(
+        '<em id="publish_time">2026-07-01</em><em id="publish_time">2026-07-01</em>',
+      ),
+    ).toBe("2026-07-01");
+    expect(
+      await publishedDate(
+        '<div id="js_content"><time itemprop="datePublished">2000-01-01</time></div><em id="publish_time">2026-07-01</em>',
+      ),
+    ).toBe("2026-07-01");
+  });
+
+  test.each([
+    '<em id="publish_time">2026-07-01</em><meta property="article:published_time" content="2026-07-02">',
+    '<em id="publish_time">2026-07-01</em><em id="publish_time">2026-07-02</em>',
+    '<meta name="datePublished" content="2026-07-01"><meta name="datePublished" content="2026-07-02">',
+    '<em id="publish_time">2026-07-01</em><script>var ct = 1782921600;</script>',
+    '<em id="publish_time">7月1日</em><meta name="datePublished" content="2026-07-01">',
+    '<em id="publish_time">2026-02-30</em><meta name="datePublished" content="2026-03-02">',
+  ])(
+    "fails closed for conflicting or incomplete signals: %s",
+    async (fragment) => {
+      expect(await publishedDate(fragment)).toBeNull();
+    },
+  );
+});
+
 describe("official IMA response shapes", () => {
   test("incomplete pagination is an error rather than a false absence", async () => {
     spies.push(

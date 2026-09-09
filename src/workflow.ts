@@ -35,7 +35,14 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
         },
         async () => {
           const job = await jobById(this.env, id);
-          if (job.object_key && (await this.env.PDFS.head(job.object_key)))
+          const archived =
+            job.object_key && (await this.env.PDFS.head(job.object_key));
+          // Reuse checked metadata, including an explicitly unknown publication date.
+          // Already uploaded media keeps its original name for safe add/verification retries.
+          if (
+            archived &&
+            (job.publication_date_checked_at || (job.media_id && job.cos_key))
+          )
             return;
           await updateJob(this.env, id, { stage: "downloading", error: null });
           const links = await convertArticle(job.source_url);
@@ -44,16 +51,32 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
           const articleKey = info.canonical
             ? `url:${await digest(info.canonical)}`
             : (info.identity ?? `url:${job.url_hash}`);
+          if (archived) {
+            if (job.article_key && articleKey !== job.article_key)
+              throw new AppError(
+                "重新获取的文章与已保存 PDF 不一致，请重新创建导入任务。",
+                409,
+              );
+            await updateJob(this.env, id, {
+              published_date: info.publishedDate,
+              publication_date_checked_at: new Date().toISOString(),
+              file_name: fileName(job.title ?? info.title, info.publishedDate),
+              stage: "saved",
+            });
+            return;
+          }
           await updateJob(this.env, id, {
             stage: "validating",
             title: info.title,
             account_name: info.publisher || null,
             account_key: info.accountKey,
             article_key: articleKey,
+            published_date: info.publishedDate,
+            publication_date_checked_at: new Date().toISOString(),
           });
           const pdf = await download(links.pdf, MAX_PDF_BYTES);
           const pages = await validatePdf(pdf);
-          const filename = fileName(info.title, job.created_at.slice(0, 10));
+          const filename = fileName(info.title, info.publishedDate);
           const objectKey = `pdf/${job.profile_id}/${id}.pdf`;
           await this.env.PDFS.put(objectKey, pdf, {
             httpMetadata: {
@@ -188,7 +211,7 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
           for (let copy = 1; copy <= 100; copy++) {
             const candidate = fileName(
               job.title ?? "微信公众号文章",
-              job.created_at.slice(0, 10),
+              job.published_date,
               copy,
             );
             if (await repeatedName(c, job.kb_id as string, candidate)) continue;

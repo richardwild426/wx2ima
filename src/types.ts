@@ -57,6 +57,8 @@ export interface Job {
   updated_at: string;
   completed_at: string | null;
   pdf_deleted_at: string | null;
+  published_date: string | null;
+  publication_date_checked_at: string | null;
 }
 export interface KnowledgeBase {
   id: string;

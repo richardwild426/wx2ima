@@ -40,6 +40,8 @@ const fields = new Set([
   "workflow_id",
   "attempts",
   "completed_at",
+  "published_date",
+  "publication_date_checked_at",
 ]);
 export async function updateJob(env: Env, id: string, values: Partial<Job>) {
   const entries = Object.entries(values).filter(([k]) => fields.has(k));
@@ -103,5 +105,6 @@ export function publicJob(j: Job) {
     has_pdf: !!j.object_key && !j.pdf_deleted_at,
     pdf_deleted_at: j.pdf_deleted_at ?? null,
     pdf_expires_at: pdfExpiresAt(j),
+    published_date: j.published_date ?? null,
   };
 }

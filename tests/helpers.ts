@@ -50,6 +50,15 @@ export function testEnv({ applyRetentionMigration = true } = {}) {
         "utf8",
       ),
     );
+  db.exec(
+    readFileSync(
+      new URL(
+        "../migrations/0005_article_publication_date.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
   function prepare(sql: string) {
     let bindings: unknown[] = [];
     function execute() {

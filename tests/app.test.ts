@@ -104,6 +104,9 @@ async function workflowFixture() {
     visible = true;
   const entries: { media_id: string; title: string }[] = [];
   const occupiedNames = new Set<string>();
+  let publicationDate: string | null = "2020年6月18日 09:30";
+  let pdfDownloads = 0;
+  let conversions = 0;
   spies.push(
     spyOn(fetchTarget, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
@@ -111,7 +114,8 @@ async function workflowFixture() {
         init?.body && typeof init.body === "string"
           ? JSON.parse(init.body)
           : {};
-      if (url === "https://changfengbox.top/api/mcp")
+      if (url === "https://changfengbox.top/api/mcp") {
+        if (parsed.method === "tools/call") conversions++;
         return Response.json(
           {
             jsonrpc: "2.0",
@@ -138,12 +142,15 @@ async function workflowFixture() {
           },
           { headers: { "Mcp-Session-Id": "test" } },
         );
+      }
       if (url === "https://changfengbox.top/a.html")
         return new Response(
-          '<meta property="og:title" content="An article"><meta property="og:url" content="https://mp.weixin.qq.com/s/abc"><span id="js_name">Publisher</span>',
+          `<meta property="og:title" content="An article"><meta property="og:url" content="https://mp.weixin.qq.com/s/abc"><span id="js_name">Publisher</span>${publicationDate ? `<em id="publish_time">${publicationDate}</em>` : ""}`,
         );
-      if (url === "https://changfengbox.top/a.pdf")
+      if (url === "https://changfengbox.top/a.pdf") {
+        pdfDownloads++;
         return new Response(new Uint8Array(pdfBytes).buffer);
+      }
       if (url.includes(".myqcloud.com")) {
         const uploaded = await new Response(
           init?.body as BodyInit,
@@ -227,6 +234,10 @@ async function workflowFixture() {
     db,
     objects,
     occupiedNames,
+    sourceCounts: () => ({ pdfDownloads, conversions }),
+    setPublicationDate: (value: string | null) => {
+      publicationDate = value;
+    },
     run,
     counts: () => ({ creates, adds }),
     setPutFails: (value: boolean) => {
@@ -254,7 +265,7 @@ test("full import uses Unsorted, archives PDF and verifies the IMA entry", async
     (f.db.prepare("SELECT completed_at FROM jobs WHERE id='job'").get() as Job)
       .completed_at,
   ).not.toBeNull();
-  expect(job.file_name).toMatch(/^\d{4}-\d{2}-\d{2}_An article\.pdf$/);
+  expect(job.file_name).toBe("2020-06-18_An article.pdf");
   expect(f.objects.size).toBe(1);
   expect(f.counts()).toEqual({ creates: 1, adds: 1 });
   await f.run();
@@ -262,10 +273,7 @@ test("full import uses Unsorted, archives PDF and verifies the IMA entry", async
 });
 test("filename collisions use readable numbers and retries do not stack suffixes", async () => {
   const f = await workflowFixture();
-  const { created_at: createdAt } = f.db
-    .prepare("SELECT created_at FROM jobs WHERE id='job'")
-    .get() as { created_at: string };
-  const base = `${createdAt.slice(0, 10)}_An article`;
+  const base = "2020-06-18_An article";
   f.occupiedNames.add(`${base}.pdf`);
   f.db
     .prepare(
@@ -290,6 +298,7 @@ test("filename collisions use readable numbers and retries do not stack suffixes
     ).file_name,
   ).toBe(`${base}（3）.pdf`);
   f.setPutFails(false);
+  f.setPublicationDate("2026年9月9日");
   await f.run();
   const saved = f.db
     .prepare("SELECT file_name,stage FROM jobs WHERE id='job'")
@@ -1428,6 +1437,11 @@ describe("profile verification and concurrent changes", () => {
         original.object_key,
         original.kb_id,
       );
+    f.db
+      .prepare(
+        "UPDATE jobs SET publication_date_checked_at=datetime('now') WHERE id=?",
+      )
+      .run(replayId);
     f.remote.mockImplementation(async (input, init) => {
       expect(String(input)).toBe(
         "https://ima.qq.com/openapi/wiki/v1/get_knowledge_list",
@@ -1524,4 +1538,60 @@ test("expired R2 archives do not cause another IMA upload when the same article 
   expect(duplicate.completed_at).not.toBeNull();
   expect(f.db.prepare("SELECT * FROM imports").all()).toEqual(ledger);
   expect(f.objects.size).toBe(1);
+});
+
+test("missing publication dates remain explicit and are not replaced by the import date", async () => {
+  const f = await workflowFixture();
+  f.setPublicationDate(null);
+  f.setPutFails(true);
+  await expect(f.run()).rejects.toThrow();
+  f.setPutFails(false);
+  f.setPublicationDate("2026年9月9日");
+  await f.run();
+  const job = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+  expect(job.file_name).toBe("发布日期未知_An article.pdf");
+  expect(job.published_date).toBeNull();
+  expect(job.publication_date_checked_at).not.toBeNull();
+  expect(f.sourceCounts()).toEqual({ conversions: 1, pdfDownloads: 1 });
+});
+
+test("legacy archived retries refresh publication metadata without downloading another PDF", async () => {
+  const f = await workflowFixture();
+  f.setPutFails(true);
+  await expect(f.run()).rejects.toThrow();
+  const before = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+  f.db
+    .prepare(
+      "UPDATE jobs SET published_date=NULL,publication_date_checked_at=NULL,file_name='2026-09-09_An article.pdf' WHERE id='job'",
+    )
+    .run();
+  f.setPutFails(false);
+  await f.run();
+  const job = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+  expect(job.file_name).toBe("2020-06-18_An article.pdf");
+  expect(job.published_date).toBe("2020-06-18");
+  expect(job.file_hash).toBe(before.file_hash);
+  expect(job.object_key).toBe(before.object_key);
+  expect(f.sourceCounts()).toEqual({ conversions: 2, pdfDownloads: 1 });
+});
+
+test("already uploaded legacy media keeps its name when reconciling an ambiguous add", async () => {
+  const f = await workflowFixture();
+  f.setAmbiguous(true);
+  await expect(f.run()).rejects.toThrow();
+  const before = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+  f.db
+    .prepare(
+      "UPDATE jobs SET published_date=NULL,publication_date_checked_at=NULL WHERE id='job'",
+    )
+    .run();
+  f.setPublicationDate("2026年9月9日");
+  f.setAmbiguous(false);
+  await f.run();
+  const job = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+  expect(job.file_name).toBe(before.file_name);
+  expect(job.media_id).toBe(before.media_id);
+  expect(job.stage).toBe("complete");
+  expect(f.counts()).toEqual({ creates: 1, adds: 1 });
+  expect(f.sourceCounts()).toEqual({ conversions: 1, pdfDownloads: 1 });
 });
