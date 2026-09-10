@@ -59,6 +59,12 @@ export function testEnv({ applyRetentionMigration = true } = {}) {
       "utf8",
     ),
   );
+  db.exec(
+    readFileSync(
+      new URL("../migrations/0006_import_queue.sql", import.meta.url),
+      "utf8",
+    ),
+  );
   function prepare(sql: string) {
     let bindings: unknown[] = [];
     function execute() {
@@ -120,6 +126,9 @@ export function testEnv({ applyRetentionMigration = true } = {}) {
       },
     },
     IMPORTS: {
+      async createBatch() {
+        return [];
+      },
       async create() {
         return { id: "test-workflow" };
       },

@@ -1,5 +1,12 @@
 import { PDFDocument } from "pdf-lib";
 import { articleIdentity, assertPublicDownload } from "./article";
+import {
+  isExplicitMcpRateLimit,
+  ProviderRateLimitError,
+  parseRetryAfter,
+  throwIfProviderRateLimited,
+  withProviderRateLimitRetry,
+} from "./provider-limits";
 import { AppError } from "./types";
 
 const ENDPOINT = "https://changfengbox.top/api/mcp";
@@ -43,9 +50,22 @@ export async function readLimited(
   return bytes;
 }
 async function rpc(
-  body: unknown,
+  body: { method: string; [key: string]: unknown },
   session?: string,
   timeout = 30000,
+): Promise<{ data: RpcResult; session: string | null }> {
+  const payload = JSON.stringify(body);
+  // Retry the rejected RPC only; replaying initialization or conversion as a unit is unsafe.
+  return withProviderRateLimitRetry(() =>
+    rpcRequest(payload, body.method, session, timeout),
+  );
+}
+
+async function rpcRequest(
+  payload: string,
+  operation: string,
+  session: string | undefined,
+  timeout: number,
 ): Promise<{ data: RpcResult; session: string | null }> {
   let response: Response;
   try {
@@ -57,7 +77,7 @@ async function rpc(
         "MCP-Protocol-Version": "2025-06-18",
         ...(session ? { "Mcp-Session-Id": session } : {}),
       },
-      body: JSON.stringify(body),
+      body: payload,
       signal: AbortSignal.timeout(timeout),
       redirect: "manual",
     });
@@ -70,7 +90,16 @@ async function rpc(
     });
     throw new AppError("文章服务未响应，请重试导入。", 502);
   }
+  await throwIfProviderRateLimited(response, "changfeng", operation);
   if (!response.ok) throw new AppError("文章服务暂时不可用，请稍后重试。", 502);
+  // MCP notifications are acknowledged with an empty 202; they have no JSON-RPC result.
+  if (
+    operation.startsWith("notifications/") &&
+    (response.status === 202 || response.status === 204)
+  ) {
+    await response.body?.cancel();
+    return { data: {}, session: response.headers.get("Mcp-Session-Id") };
+  }
   const text = new TextDecoder().decode(
     await readLimited(response, 1024 * 1024),
   );
@@ -94,9 +123,44 @@ async function rpc(
   } catch {
     throw new AppError("无法解析文章服务返回的数据。", 502);
   }
+  if (isMcpRateLimit(data))
+    throw new ProviderRateLimitError("changfeng", operation, {
+      retryAfterMs: parseRetryAfter(response.headers.get("retry-after")),
+      upstreamStatus: response.status,
+    });
   if (data.error || data.result?.isError)
     throw new AppError("文章服务无法获取此文章，请检查链接是否可以访问。", 502);
   return { data, session: response.headers.get("Mcp-Session-Id") };
+}
+
+/** Tool errors may be encoded inside text blocks even when the HTTP response is successful. */
+function isMcpRateLimit(data: RpcResult): boolean {
+  if (data.error && !data.result) return isExplicitMcpRateLimit(data.error);
+  const content = data.result?.content;
+  if (!Array.isArray(content)) return false;
+  let limited = false;
+  for (const block of content) {
+    if (block.type !== "text" || !block.text) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(block.text);
+    } catch {
+      limited ||=
+        data.result?.isError === true && isExplicitMcpRateLimit(block.text);
+      continue;
+    }
+    if (data.result?.isError === true)
+      limited ||= isExplicitMcpRateLimit(value);
+    if (!value || typeof value !== "object") continue;
+    const result = value as Record<string, unknown>;
+    // A partial/successful conversion must not be replayed because another block is limited.
+    if (result.status === "completed" || Array.isArray(result.urls))
+      return false;
+    limited ||=
+      (result.status === "error" || result.status === "failed") &&
+      isExplicitMcpRateLimit(result);
+  }
+  return limited;
 }
 export function parseDownloadResult(data: RpcResult): {
   pdf: string;
@@ -177,11 +241,16 @@ export async function download(url: string, limit: number) {
   for (let i = 0; i < 3; i++) {
     let response: Response;
     try {
-      response = await fetch(target, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(90000),
+      response = await withProviderRateLimitRetry(async () => {
+        const result = await fetch(target, {
+          redirect: "manual",
+          signal: AbortSignal.timeout(90000),
+        });
+        await throwIfProviderRateLimited(result, "changfeng", "download");
+        return result;
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ProviderRateLimitError) throw error;
       throw new AppError("文章文件下载失败，请重试。", 502);
     }
     if (response.status >= 300 && response.status < 400) {

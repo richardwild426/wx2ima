@@ -6,6 +6,12 @@ import {
   editProfile,
   inputText as text,
 } from "./profiles";
+import {
+  dispatchQueue,
+  enqueueArticles,
+  kickQueue,
+  queueSummary,
+} from "./queue";
 import { cleanupExpiredPdfs } from "./retention";
 import {
   checkOrigin,
@@ -24,7 +30,6 @@ import {
   publicJob,
   publicProfile,
   requireActiveProfile,
-  updateJob,
 } from "./store";
 import {
   AppError,
@@ -186,39 +191,14 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     const profileId = new URL(request.url).searchParams.get("profile");
     if (!profileId) throw new AppError("请选择 IMA 账号。");
     const { results } = await env.DB.prepare(
-      "SELECT * FROM jobs WHERE profile_id=? ORDER BY created_at DESC LIMIT 100",
+      "SELECT * FROM jobs WHERE profile_id=? ORDER BY CASE WHEN stage NOT IN ('complete','duplicate','failed') AND (workflow_id IS NOT NULL OR stage<>'queued') THEN 0 ELSE 1 END,updated_at DESC,rowid DESC LIMIT 100",
     )
       .bind(profileId)
       .all<Job>();
-    // Resource limits can terminate an isolate before its failure handler updates D1.
-    await Promise.all(
-      results.map(async (job) => {
-        if (
-          !job.workflow_id ||
-          ["complete", "duplicate", "failed"].includes(job.stage) ||
-          Date.now() - Date.parse(`${job.updated_at.replace(" ", "T")}Z`) <
-            120000
-        )
-          return;
-        try {
-          const status = await (
-            await env.IMPORTS.get(job.workflow_id)
-          ).status();
-          if (status.status === "errored" || status.status === "terminated") {
-            job.stage = "failed";
-            job.error =
-              "后台处理已停止，请重试；若 PDF 已保存，将从已保存的文件继续处理。";
-            await updateJob(env, job.id, {
-              stage: job.stage,
-              error: job.error,
-            });
-          }
-        } catch {
-          /* A transient status read must not mark a live import as failed. */
-        }
-      }),
-    );
-    return json({ jobs: results.map(publicJob) });
+    return json({
+      jobs: results.map(publicJob),
+      queue: await queueSummary(env, profileId),
+    });
   }
   if (path === "/api/jobs" && request.method === "POST") {
     const body = await jsonBody<{ profileId: unknown; urls: unknown }>(request);
@@ -227,68 +207,22 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     );
     if (!p.inbox_id)
       throw new AppError("请先在账号设置中选择待分类知识库。", 409);
+    // A transport bound keeps one request within Worker limits; the browser chunks any-size batches.
     if (
       !Array.isArray(body.urls) ||
       body.urls.length < 1 ||
-      body.urls.length > 10 ||
+      body.urls.length > 100 ||
       body.urls.some((x) => typeof x !== "string")
     )
-      throw new AppError("请提交 1 至 10 个文章链接。");
+      throw new AppError(
+        "单次接口请求支持 1 至 100 条链接，网页会自动分批提交。",
+      );
     const urls = [
       ...new Set(body.urls.map((u: string) => normalizeArticleUrl(u))),
     ];
-    await rateLimit(env, `imports:${p.id}`, 50, 3600);
-    const count = await env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM jobs WHERE stage NOT IN ('complete','duplicate','failed')",
-    ).first<{ count: number }>();
-    if ((count?.count ?? 0) + urls.length > 20)
-      throw new AppError("网站正在处理其他导入任务，请稍后重试。", 429);
-    const results = [];
-    for (const url of urls) {
-      const hash = await digest(url);
-      const active = await env.DB.prepare(
-        "SELECT * FROM jobs WHERE profile_id=? AND url_hash=? AND stage NOT IN ('complete','duplicate','failed')",
-      )
-        .bind(p.id, hash)
-        .first<Job>();
-      if (active) {
-        results.push(publicJob(active));
-        continue;
-      }
-      const id = crypto.randomUUID();
-      const insert = await env.DB.prepare(
-        "INSERT OR IGNORE INTO jobs(id,profile_id,source_url,url_hash,workflow_id) SELECT ?,id,?,?,? FROM profiles WHERE id=? AND deleted_at IS NULL AND inbox_id IS NOT NULL",
-      )
-        .bind(id, url, hash, id, p.id)
-        .run();
-      if (!insert.meta.changes) {
-        requireActiveProfile(await profile(env, p.id));
-        const existing = await env.DB.prepare(
-          "SELECT * FROM jobs WHERE profile_id=? AND url_hash=? AND stage NOT IN ('complete','duplicate','failed')",
-        )
-          .bind(p.id, hash)
-          .first<Job>();
-        if (!existing)
-          throw new AppError("账号配置已变化，请刷新后重试。", 409);
-        results.push(publicJob(existing));
-        continue;
-      }
-      try {
-        await env.IMPORTS.create({ id, params: { jobId: id } });
-      } catch {
-        // A create timeout may still have scheduled the workflow; check before declaring failure.
-        try {
-          await (await env.IMPORTS.get(id)).status();
-        } catch {
-          await updateJob(env, id, {
-            stage: "failed",
-            error: "无法启动导入任务，请重试。",
-          });
-        }
-      }
-      results.push(publicJob(await jobById(env, id)));
-    }
-    return json({ jobs: results }, 202);
+    const jobs = await enqueueArticles(env, p.id, urls);
+    await kickQueue(env);
+    return json({ jobs: jobs.map(publicJob) }, 202);
   }
   const jobRoute = path.match(/^\/api\/jobs\/([a-f0-9-]+)(?:\/(pdf|retry))?$/);
   if (jobRoute) {
@@ -316,26 +250,14 @@ export async function handle(request: Request, env: Env): Promise<Response> {
       if (job.stage !== "failed")
         throw new AppError("仅可重试失败的导入任务。", 409);
       await rateLimit(env, `retry:${job.id}`, 5, 3600);
-      const workflowId = crypto.randomUUID();
       const changed = await env.DB.prepare(
-        "UPDATE jobs SET stage='queued',error=NULL,attempts=attempts+1,workflow_id=?,updated_at=datetime('now') WHERE id=? AND stage='failed' AND EXISTS (SELECT 1 FROM profiles WHERE id=jobs.profile_id AND deleted_at IS NULL)",
+        "UPDATE jobs SET stage='queued',error=NULL,attempts=attempts+1,workflow_id=NULL,updated_at=datetime('now') WHERE id=? AND stage='failed' AND EXISTS (SELECT 1 FROM profiles WHERE id=jobs.profile_id AND deleted_at IS NULL)",
       )
-        .bind(workflowId, job.id)
+        .bind(job.id)
         .run();
       if (!changed.meta.changes)
         throw new AppError("此导入任务已在重试中。", 409);
-      try {
-        await env.IMPORTS.create({ id: workflowId, params: { jobId: job.id } });
-      } catch {
-        try {
-          await (await env.IMPORTS.get(workflowId)).status();
-        } catch {
-          await updateJob(env, job.id, {
-            stage: "failed",
-            error: "无法启动重试任务，请再次重试。",
-          });
-        }
-      }
+      await kickQueue(env);
       return json({ job: publicJob(await jobById(env, job.id)) }, 202);
     }
     if (!jobRoute[2] && request.method === "GET")
@@ -344,8 +266,9 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   throw new AppError("未找到请求的资源。", 404);
 }
 export default {
-  async scheduled(_controller: ScheduledController, env: Env) {
-    await cleanupExpiredPdfs(env);
+  async scheduled(controller: ScheduledController, env: Env) {
+    if (controller.cron === "* * * * *") await dispatchQueue(env);
+    else await cleanupExpiredPdfs(env);
   },
   async fetch(request: Request, env: Env): Promise<Response> {
     let response: Response;

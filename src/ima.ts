@@ -1,4 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
+import {
+  ProviderRateLimitError,
+  parseRetryAfter,
+  throwIfProviderRateLimited,
+  withProviderRateLimitRetry,
+} from "./provider-limits";
 import { AppError, type Credentials, type KnowledgeBase } from "./types";
 
 interface Envelope<T> {
@@ -11,6 +17,18 @@ export async function ima<T>(
   endpoint: string,
   body: unknown,
 ): Promise<T> {
+  // Serialize once so retries cannot observe caller mutations or regenerate write payloads.
+  const payload = JSON.stringify(body);
+  return withProviderRateLimitRetry(() =>
+    imaRequest<T>(credentials, endpoint, payload),
+  );
+}
+
+async function imaRequest<T>(
+  credentials: Credentials,
+  endpoint: string,
+  payload: string | undefined,
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`https://ima.qq.com/openapi/wiki/v1/${endpoint}`, {
@@ -20,13 +38,14 @@ export async function ima<T>(
         "ima-openapi-clientid": credentials.clientId,
         "ima-openapi-apikey": credentials.apiKey,
       },
-      body: JSON.stringify(body),
+      body: payload,
       redirect: "manual",
       signal: AbortSignal.timeout(30000),
     });
   } catch {
     throw new AppError("IMA 未响应，请先检查导入状态再重试。", 502);
   }
+  await throwIfProviderRateLimited(response, "ima", endpoint);
   if (!response.ok)
     throw new AppError(
       response.status === 401 || response.status === 403
@@ -40,6 +59,13 @@ export async function ima<T>(
   } catch {
     throw new AppError("无法解析 IMA 返回的数据。", 502);
   }
+  // Official wiki references document 110021; shared API-key throttling is 20002.
+  if (result.code === 110021 || result.code === 20002)
+    throw new ProviderRateLimitError("ima", endpoint, {
+      retryAfterMs: parseRetryAfter(response.headers.get("retry-after")),
+      upstreamStatus: response.status,
+      providerCode: result.code,
+    });
   if (result.code !== 0) {
     // Remove any credential echo or signed URL before presenting an upstream business error.
     let message = typeof result.msg === "string" ? result.msg : "";
@@ -183,9 +209,18 @@ export async function uploadCos(
   const { host, pathname, authorization } = cosAuthorization(c, size);
   // COS signs Content-Length; Workers only guarantee that header for a fixed-length body.
   const fixed = new FixedLengthStream(size);
-  const transfer = body.pipeTo(fixed.writable);
-  const [response] = await Promise.all([
-    fetch(
+  const controller = new AbortController();
+  const signal = AbortSignal.any([
+    controller.signal,
+    AbortSignal.timeout(120000),
+  ]);
+  // Observe transfer failures immediately, including a rejection before fetch settles.
+  const transfer = body.pipeTo(fixed.writable, { signal }).then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  try {
+    const response = await fetch(
       `https://${host}${pathname.split("/").map(encodeURIComponent).join("/")}`,
       {
         method: "PUT",
@@ -197,15 +232,26 @@ export async function uploadCos(
           "x-cos-security-token": c.token,
         },
         redirect: "manual",
-        signal: AbortSignal.timeout(120000),
+        signal,
       },
-    ),
-    transfer,
-  ]);
-  if (!response.ok)
-    throw new AppError(
-      "PDF 上传至 IMA 存储失败，可使用已保存的 PDF 重试。",
-      502,
     );
-  await response.body?.cancel();
+    // COS can reject before reading the stream. Do not wait for an unconsumed pipe.
+    if (!response.ok) controller.abort();
+    await throwIfProviderRateLimited(response, "cos", "upload", false);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new AppError(
+        "PDF 上传至 IMA 存储失败，可使用已保存的 PDF 重试。",
+        502,
+      );
+    }
+    await response.body?.cancel();
+    const transferred = await transfer;
+    if (!transferred.ok) throw transferred.error;
+  } finally {
+    controller.abort();
+    // An early rejection can leave a pending write blocked by the unread fixed stream.
+    await fixed.readable.cancel().catch(() => {});
+    await transfer;
+  }
 }

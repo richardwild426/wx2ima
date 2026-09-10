@@ -107,9 +107,15 @@ async function workflowFixture() {
   let publicationDate: string | null = "2020年6月18日 09:30";
   let pdfDownloads = 0;
   let conversions = 0;
+  let throttledEndpoint: string | null = null;
   spies.push(
     spyOn(fetchTarget, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
+      if (throttledEndpoint && url.endsWith(throttledEndpoint))
+        return new Response("", {
+          status: 429,
+          headers: { "Retry-After": "3600" },
+        });
       const parsed =
         init?.body && typeof init.body === "string"
           ? JSON.parse(init.body)
@@ -235,6 +241,9 @@ async function workflowFixture() {
     objects,
     occupiedNames,
     sourceCounts: () => ({ pdfDownloads, conversions }),
+    throttle: (endpoint: string | null) => {
+      throttledEndpoint = endpoint;
+    },
     setPublicationDate: (value: string | null) => {
       publicationDate = value;
     },
@@ -1116,7 +1125,10 @@ describe("profile deletion and restoration", () => {
     ).toBe(200);
     const retried = await f.request(`/api/jobs/${failedJob}/retry`, "POST", {});
     expect(retried.status).toBe(202);
-    expect(f.startWorkflow).toHaveBeenCalledTimes(1);
+    expect(f.startWorkflow).not.toHaveBeenCalled();
+    expect(((await retried.json()) as { job: PublicJob }).job.stage).toBe(
+      "queued",
+    );
   });
 
   test("failure clearing mappings rolls back credential removal and the deletion marker", async () => {
@@ -1354,6 +1366,15 @@ describe("profile verification and concurrent changes", () => {
               : /UPDATE jobs SET stage='queued'/i.test(sql);
           if (!paused && isAdmission) {
             paused = true;
+            if (action === "submit") {
+              const all = statement.all.bind(statement);
+              statement.all = async <T>() => {
+                entered.resolve();
+                await release.promise;
+                return all<T>();
+              };
+              return statement;
+            }
             const run = statement.run.bind(statement);
             statement.run = async <T>() => {
               entered.resolve();
@@ -1396,7 +1417,7 @@ describe("profile verification and concurrent changes", () => {
       (await f.request(`/api/profiles/${profileA}`, "DELETE", {})).status,
     ).toBe(409);
     expect(f.snapshot()).toEqual(beforeDeletion);
-    expect(f.startWorkflow).toHaveBeenCalledTimes(1);
+    expect(f.startWorkflow).not.toHaveBeenCalled();
     expect(f.profile().deleted_at).toBeNull();
     expect(
       await decrypt<Credentials>(
@@ -1594,4 +1615,55 @@ test("already uploaded legacy media keeps its name when reconciling an ambiguous
   expect(job.stage).toBe("complete");
   expect(f.counts()).toEqual({ creates: 1, adds: 1 });
   expect(f.sourceCounts()).toEqual({ conversions: 1, pdfDownloads: 1 });
+});
+
+test.each(["api/mcp", "create_media", "add_knowledge"])(
+  "provider 429 at %s durably queues the import and resumes without duplicate media",
+  async (endpoint) => {
+    const f = await workflowFixture();
+    f.throttle(endpoint);
+    const requestedAt = Date.now();
+    expect(await f.run()).toEqual({ status: "queued" });
+    const job = f.db.prepare("SELECT * FROM jobs WHERE id='job'").get() as Job;
+    expect(job.stage).toBe("queued");
+    expect(job.workflow_id).toBeNull();
+    expect(job.add_state).toBeNull();
+    const control = f.db
+      .prepare("SELECT cooldown_until FROM import_queue_control")
+      .get() as { cooldown_until: string };
+    expect(
+      Date.parse(`${control.cooldown_until.replace(" ", "T")}Z`),
+    ).toBeGreaterThanOrEqual(requestedAt + 3600000);
+    const before = f.counts();
+    f.throttle(null);
+    f.db
+      .prepare(
+        "UPDATE import_queue_control SET cooldown_until='2000-01-01 00:00:00'",
+      )
+      .run();
+    await f.run();
+    expect(f.counts()).toEqual({ creates: 1, adds: 1 });
+    expect(f.sourceCounts()).toEqual({ conversions: 1, pdfDownloads: 1 });
+    if (endpoint === "add_knowledge") expect(before.creates).toBe(1);
+  },
+);
+
+test("authenticated batch API accepts more than ten links and reports the persistent queue", async () => {
+  const f = await profileFixture();
+  const response = await f.request("/api/jobs", "POST", {
+    profileId: profileA,
+    urls: Array.from(
+      { length: 60 },
+      (_, i) => `https://mp.weixin.qq.com/s/bulk-${i}`,
+    ),
+  });
+  expect(response.status).toBe(202);
+  expect(((await response.json()) as { jobs: PublicJob[] }).jobs).toHaveLength(
+    60,
+  );
+  const history = await f.request(`/api/jobs?profile=${profileA}`);
+  expect(
+    ((await history.json()) as { queue: { queued: number } }).queue.queued,
+  ).toBe(60);
+  expect(f.startWorkflow).not.toHaveBeenCalled();
 });

@@ -2,6 +2,7 @@ import {
   WorkflowEntrypoint,
   type WorkflowEvent,
   type WorkflowStep,
+  type WorkflowStepConfig,
 } from "cloudflare:workers";
 import { fileName } from "./article";
 import {
@@ -19,6 +20,8 @@ import {
   metadata,
   validatePdf,
 } from "./mcp";
+import { ProviderRateLimitError } from "./provider-limits";
+import { deferImport, kickQueue } from "./queue";
 import { decrypt, digest, publicError } from "./security";
 import { jobById, profile, updateJob } from "./store";
 import { AppError, type Credentials, type Env, type Mapping } from "./types";
@@ -26,8 +29,32 @@ import { AppError, type Credentials, type Env, type Mapping } from "./types";
 export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
   async run(event: WorkflowEvent<{ jobId: string }>, step: WorkflowStep) {
     const id = event.payload.jobId;
+    const runStep = async (
+      name: string,
+      config: WorkflowStepConfig,
+      callback: () => Promise<unknown>,
+    ) => {
+      const result = await step.do(name, config, async () => {
+        try {
+          return (await callback()) === true;
+        } catch (error) {
+          if (!(error instanceof ProviderRateLimitError)) throw error;
+          // Persist an explicit rejection as step output: Workflow error serialization
+          // cannot preserve custom error classes, and automatic step retries may ignore Retry-After.
+          return {
+            deferUntil: Math.min(
+              Date.UTC(9999, 11, 31),
+              Math.max(Date.now() + 60000, error.retryAt),
+            ),
+          };
+        }
+      });
+      if (result && typeof result === "object" && "deferUntil" in result)
+        throw new QueueDeferred(result.deferUntil);
+      return result;
+    };
     try {
-      await step.do(
+      await runStep(
         "archive-pdf",
         {
           retries: { limit: 1, delay: "30 seconds", backoff: "exponential" },
@@ -93,7 +120,7 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
           });
         },
       );
-      const skip = await step.do(
+      const skip = await runStep(
         "resolve-destination",
         { retries: { limit: 1, delay: "10 seconds" }, timeout: "2 minutes" },
         async () => {
@@ -191,7 +218,7 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
         },
       );
       if (skip) return { status: "duplicate" };
-      await step.do(
+      await runStep(
         "upload-pdf",
         { retries: { limit: 1, delay: "15 seconds" }, timeout: "4 minutes" },
         async () => {
@@ -250,7 +277,7 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
           });
         },
       );
-      await step.do(
+      await runStep(
         "add-to-ima",
         { retries: { limit: 1, delay: "20 seconds" }, timeout: "2 minutes" },
         async () => {
@@ -287,14 +314,17 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
             });
             await updateJob(this.env, id, { add_state: "accepted" });
           } catch (error) {
-            if (error instanceof AppError && error.status === 422) {
+            if (
+              error instanceof ProviderRateLimitError ||
+              (error instanceof AppError && error.status === 422)
+            ) {
               await updateJob(this.env, id, { add_state: null });
             }
             throw error;
           }
         },
       );
-      await step.do(
+      await runStep(
         "verify-entry",
         {
           retries: { limit: 3, delay: "10 seconds", backoff: "exponential" },
@@ -338,6 +368,12 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
       );
       return { status: "complete" };
     } catch (error) {
+      if (error instanceof QueueDeferred) {
+        await step.do("defer-import", async () => {
+          await deferImport(this.env, id, new Date(error.until));
+        });
+        return { status: "queued" };
+      }
       await step.do("record-failure", async () => {
         await updateJob(this.env, id, {
           stage: "failed",
@@ -346,6 +382,14 @@ export class ImportWorkflow extends WorkflowEntrypoint<Env, { jobId: string }> {
       });
       // D1 carries the actionable failure; throwing marks the Workflow as failed too.
       throw new Error("Import failed. See the import record for details.");
+    } finally {
+      await kickQueue(this.env);
     }
+  }
+}
+
+class QueueDeferred extends Error {
+  constructor(readonly until: number) {
+    super("Import deferred by provider throttling.");
   }
 }

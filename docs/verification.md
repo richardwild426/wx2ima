@@ -4,7 +4,7 @@ This record omits deployment identifiers, domains, account details, knowledge-ba
 
 ## Automated verification
 
-Type checking, linting, and 158 tests (1,292 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
+Type checking, linting, and 176 tests (1,383 assertions) passed at the latest application change. Tests use an in-memory SQLite adapter and synthetic provider fixtures, without real credentials.
 
 Coverage includes:
 
@@ -53,3 +53,13 @@ Previously uploaded IMA entries retain their original filenames. New imports use
 - A live public article's converted HTML contained a Chinese date in `#publish_time` and a second empty placeholder. Parsing the actual response returned its correct publication day. Fixtures cover that structure, explicit publication metadata, Unix seconds, timezone boundaries, invalid calendar dates, and exclusion of prose, modification dates, and download dates.
 - Workflow tests cover an older article imported today, collisions and retries retaining its publication date, unknown dates remaining unknown, and metadata refresh for a legacy archive without another PDF download. Already uploaded media retains its existing name when reconciling an ambiguous IMA write.
 - The publication date does not shorten the 365-day retention period, which still starts at successful IMA verification. Existing uploaded entries are not renamed. This release did not perform an additional real IMA upload.
+
+## Persistent import queue
+
+- The paste limit and twenty-active-job rejection were replaced with automatic browser chunking and atomic D1 enqueue acknowledgments. Transport chunks are bounded, but the browser has no total link-count cap. Accepted chunks survive closed pages; unacknowledged input remains available after errors.
+- A conditional D1 update reserves one global workflow slot. Completion and failure kick the next job; a per-minute cron reconciles killed workflows and uncertain creation responses, reusing the original instance ID. Existing queue entries and new submissions cannot race into parallel conversion jobs.
+- Explicit provider throttling is persisted as workflow step output and returns the import to the queue with a global cooldown. HTTP Retry-After supports seconds and HTTP dates; long waits are not slept through inside a Worker. Explicitly rejected IMA additions clear their pending marker before retry; ambiguous network outcomes retain it and reconcile instead.
+- Tests cover a hundred-link queue, simultaneous duplicate submissions, competing dispatchers, FIFO handoff, creation-response loss, stopped workflows, transient status errors, queue cooldown, chunk rollback, authenticated bulk submission, and throttling at conversion, media creation, and IMA addition. Provider tests cover documented rate errors, unread response cancellation, malformed Retry-After values, and non-retryable ambiguous failures.
+- Frontend simulation passed thirteen scenarios covering chunk sizing, full preflight validation, acknowledgment-only input removal, edited text, partial failures, fixed account selection, logout races, and queue summaries.
+- Provider investigation found no published numeric QPS, concurrency, or daily-request quota for Changfeng or IMA. The IMA ten-URL limit applies to a different endpoint; this application uploads PDFs. Serial admission is a local conservative policy, with explicit provider throttling taking precedence.
+- Live acceptance used two isolated synthetic jobs with pre-seeded PDF archives and deliberately unusable synthetic account credentials. The minute cron started the first job without a browser request, and its expected local credential failure handed off to the second job. Both reached the expected failed state with separate workflow instances. This exercised scheduling and failure recovery without calling article conversion or writing to IMA. Synthetic records and archive objects were removed afterward.

@@ -3,12 +3,15 @@ const state = {
   authenticated: false,
   profiles: [],
   jobs: [],
+  queue: null,
+  queueProfile: "",
   selected: localStorage.getItem("wx2ima.profile") || "",
   filter: "all",
   settings: "",
   bases: [],
   mappings: [],
   importing: false,
+  importBatch: null,
   settingsVersion: 0,
   connectVersion: 0,
   deleteVersion: 0,
@@ -147,6 +150,8 @@ function showLogin() {
   state.profilesVersion++;
   state.historyVersion++;
   state.jobs = [];
+  state.queue = null;
+  $("import-progress").textContent = "";
   state.profiles = [];
   $("history-list").replaceChildren();
   $("account-list").replaceChildren();
@@ -158,6 +163,7 @@ function showLogin() {
   closeDialogs();
 }
 async function api(path, options = {}) {
+  const sessionVersion = state.sessionVersion;
   let response;
   try {
     response = await fetch(`/api${path}`, {
@@ -173,7 +179,12 @@ async function api(path, options = {}) {
     .json()
     .catch(() => ({ error: "服务器返回异常，请稍后重试。" }));
   if (!response.ok) {
-    if (response.status === 401 && path !== "/login") showLogin();
+    if (
+      response.status === 401 &&
+      path !== "/login" &&
+      sessionVersion === state.sessionVersion
+    )
+      showLogin();
     throw new Error(data.error || "操作未完成，请稍后重试。");
   }
   return data;
@@ -263,8 +274,10 @@ function writableProfile(id) {
   return state.profileBusy.has(id) ? null : activeProfile(id) || null;
 }
 function selectProfile(id) {
+  if (state.importing) return;
   state.selected = id;
   state.jobs = [];
+  state.queue = null;
   $("import-error").textContent = "";
   renderProfiles();
   busy(null, loadHistory);
@@ -274,6 +287,7 @@ function selectedProfile() {
 }
 function updateDestination() {
   const profile = selectedProfile();
+  $("active-profile").disabled = state.importing;
   $("save-articles").disabled =
     loadingButtons.has($("save-articles")) ||
     state.importing ||
@@ -350,7 +364,7 @@ function renderProfiles() {
       button("删除", () => openDelete(p.id), "text-button danger-text"),
     );
     for (const action of actions.querySelectorAll("button"))
-      action.disabled = state.profileBusy.has(p.id);
+      action.disabled = state.profileBusy.has(p.id) || state.importing;
     item.append(actions);
     container.append(item);
   }
@@ -405,6 +419,7 @@ async function loadHistory() {
   const requested = state.selected;
   if (!requested) {
     state.jobs = [];
+    state.queue = null;
     renderHistory();
     $("last-updated").textContent = "导入记录保存在此工作区。";
     return;
@@ -417,6 +432,8 @@ async function loadHistory() {
   )
     return;
   state.jobs = data.jobs;
+  state.queue = data.queue || null;
+  state.queueProfile = requested;
   renderHistory();
   $("last-updated").textContent =
     `更新于 ${new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} · 最近 100 条记录`;
@@ -443,6 +460,10 @@ function renderHistory() {
   $("history-readonly").hidden = !deleted;
   $("empty-history").querySelector(".empty-hint").hidden = Boolean(deleted);
   $("history-count").textContent = String(state.jobs.length);
+  const queue = state.queueProfile === state.selected ? state.queue : null;
+  $("queue-summary").textContent = queue
+    ? `全部任务：排队 ${queue.queued} 条 · 处理中 ${queue.running} 条；下方仅显示最近 100 条记录。`
+    : "仅显示最近 100 条记录；排队总数暂不可用。";
   const jobs = state.jobs.filter(
     (j) =>
       state.filter === "all" ||
@@ -543,9 +564,21 @@ function renderHistory() {
           (event) =>
             busy(event.currentTarget, async () => {
               if (!writableProfile(j.profile_id)) return;
+              const sessionVersion = state.sessionVersion;
               await api(`/jobs/${j.id}/retry`, { method: "POST", body: "{}" });
-              await loadHistory();
-              toast("已开始重试，将复用已保存的 PDF。");
+              if (
+                sessionVersion !== state.sessionVersion ||
+                state.selected !== j.profile_id
+              )
+                return;
+              toast("已重新入队，将复用已保存的 PDF，关闭页面后也会继续处理。");
+              await loadHistory().catch(() => {
+                if (
+                  sessionVersion === state.sessionVersion &&
+                  state.selected === j.profile_id
+                )
+                  toast("重试任务已入队，但记录刷新失败，请刷新记录查看。");
+              });
             }),
           "text-button",
           `retry:${j.id}`,
@@ -934,19 +967,158 @@ $("mapping-form").addEventListener("submit", (event) => {
     "settings-error",
   );
 });
+/** Match src/article.ts so invalid sources are rejected before any batch is queued. */
+function normalizeImportUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("请输入有效的微信公众号文章链接。");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "mp.weixin.qq.com" ||
+    url.username ||
+    url.password ||
+    url.port ||
+    !/^\/s(?:\/[^/]+)?$/.test(url.pathname)
+  )
+    throw new Error("仅支持 HTTPS 格式的微信公众号文章链接。");
+  url.hash = "";
+  if (url.pathname === "/s") {
+    const stable = new URLSearchParams();
+    for (const field of ["__biz", "mid", "idx", "sn"]) {
+      const part = url.searchParams.get(field);
+      if (!part) throw new Error("文章链接不完整，请从微信复制完整链接。");
+      stable.set(field, part);
+    }
+    url.search = stable.toString();
+  } else url.search = "";
+  return url.href;
+}
+/** Preflight the complete input, including UTF-8 JSON overhead, before the first write. */
+function prepareImport(text, profileId) {
+  const spans = [];
+  const unique = new Set();
+  for (const match of text.matchAll(/\S+/g)) {
+    let url;
+    try {
+      url = normalizeImportUrl(match[0]);
+    } catch (error) {
+      throw new Error(`第 ${spans.length + 1} 条链接：${error.message}`);
+    }
+    spans.push({ start: match.index, end: match.index + match[0].length, url });
+    unique.add(url);
+  }
+  if (!unique.size) throw new Error("请输入文章链接，每行一条。");
+  const encoder = new TextEncoder();
+  const encode = (urls) => JSON.stringify({ profileId, urls });
+  const chunks = [];
+  let urls = [];
+  for (const url of unique) {
+    if (encoder.encode(encode([url])).length > 30000)
+      throw new Error("有单条文章链接过长，请从微信重新复制完整链接。");
+    if (
+      urls.length === 20 ||
+      encoder.encode(encode([...urls, url])).length > 30000
+    ) {
+      chunks.push({ urls, body: encode(urls) });
+      urls = [];
+    }
+    urls.push(url);
+  }
+  if (urls.length) chunks.push({ urls, body: encode(urls) });
+  return { text, spans, chunks, total: unique.size, confirmed: 0 };
+}
+/** Track untouched original tokens; edited or ambiguous ranges are retained for manual retry. */
+function trackImportEdit(batch, text) {
+  if (batch.text === text) return;
+  const previous = batch.text;
+  let start = 0;
+  while (
+    start < previous.length &&
+    start < text.length &&
+    previous[start] === text[start]
+  )
+    start++;
+  // Shared URL prefixes must not make a prepended link look like an edit inside the original.
+  if (start < previous.length && start < text.length)
+    while (start > 0 && /\S/.test(previous[start - 1])) start--;
+  let end = previous.length;
+  let nextEnd = text.length;
+  while (
+    end > start &&
+    nextEnd > start &&
+    previous[end - 1] === text[nextEnd - 1]
+  ) {
+    end--;
+    nextEnd--;
+  }
+  const shift = nextEnd - end;
+  batch.spans = batch.spans
+    .filter((span) => {
+      if (span.end <= start) return true;
+      if (span.start >= end) {
+        span.start += shift;
+        span.end += shift;
+        return true;
+      }
+      return false;
+    })
+    .filter(
+      (span) =>
+        (span.start === 0 || /\s/.test(text[span.start - 1])) &&
+        (span.end === text.length || /\s/.test(text[span.end])),
+    );
+  batch.text = text;
+}
+/** Remove only acknowledged, unchanged input ranges, preserving new text and the cursor. */
+function removeConfirmedInput(batch, confirmed) {
+  const field = $("article-urls");
+  trackImportEdit(batch, field.value);
+  const spans = batch.spans.filter((span) => confirmed.has(span.url));
+  for (const span of spans.reverse()) {
+    field.setRangeText("", span.start, span.end, "preserve");
+    trackImportEdit(batch, field.value);
+  }
+  field.dispatchEvent(new Event("input"));
+}
+function showImportProgress(batch, message) {
+  const label = `已入队 ${batch.confirmed} / ${batch.total} 条`;
+  $("import-progress").textContent = `${label}。${message}`;
+  const task = pendingActions.get("save-articles");
+  if (!task) return;
+  task.label = label;
+  for (const target of task.buttons) {
+    target.querySelector(".button-loading-label").textContent = label;
+    target.setAttribute("aria-label", label);
+  }
+}
 $("article-urls").addEventListener("input", () => {
+  if (state.importBatch)
+    trackImportEdit(state.importBatch, $("article-urls").value);
   const count = $("article-urls")
     .value.trim()
     .split(/\s+/)
     .filter(Boolean).length;
   $("link-count").textContent = count
-    ? `${count} 条链接 · 最多 10 条`
+    ? `${count} 条链接 · 自动去重并分批排队`
     : "每行一条文章链接";
 });
 $("paste").addEventListener("click", (event) =>
   busy(event.currentTarget, async () => {
+    const sessionVersion = state.sessionVersion;
+    const profileId = state.selected;
+    const previous = $("article-urls").value;
     try {
-      $("article-urls").value = await navigator.clipboard.readText();
+      const text = await navigator.clipboard.readText();
+      if (
+        sessionVersion !== state.sessionVersion ||
+        profileId !== state.selected ||
+        $("article-urls").value !== previous
+      )
+        return;
+      $("article-urls").value = text;
       $("article-urls").dispatchEvent(new Event("input"));
     } catch {
       throw new Error("无法读取剪贴板，请直接粘贴到输入框。");
@@ -955,34 +1127,96 @@ $("paste").addEventListener("click", (event) =>
 );
 $("import-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  if (state.importing) return;
+  if (state.importing || pendingActions.has("logout") || !state.authenticated)
+    return;
   if (!writableProfile(state.selected) || !selectedProfile()?.inbox_id) {
     $("import-error").textContent =
       "请选择可用账号并设置待分类知识库，已删除账号仅可查看记录。";
     return;
   }
-  state.importing = true;
+  const profileId = state.selected;
+  const sessionVersion = state.sessionVersion;
+  const current = () =>
+    state.authenticated &&
+    state.sessionVersion === sessionVersion &&
+    state.selected === profileId &&
+    !pendingActions.has("logout");
   busy(
     $("save-articles"),
     async () => {
-      const submitted = $("article-urls").value;
-      const urls = submitted.trim().split(/\s+/).filter(Boolean);
-      if (!urls.length || urls.length > 10)
-        throw new Error("请输入 1 至 10 条文章链接。");
-      await api("/jobs", {
-        method: "POST",
-        body: JSON.stringify({ profileId: state.selected, urls }),
-      });
-      if ($("article-urls").value === submitted) $("article-urls").value = "";
-      $("article-urls").dispatchEvent(new Event("input"));
-      await loadHistory();
-      toast("已开始导入，关闭页面后也会继续处理。");
+      $("import-progress").textContent = "";
+      const batch = prepareImport($("article-urls").value, profileId);
+      state.importBatch = batch;
+      state.importing = true;
+      renderProfiles();
+      showImportProgress(
+        batch,
+        "正在提交，全部入队前请保持页面打开；已入队任务会在后台依次处理。",
+      );
+      try {
+        for (const chunk of batch.chunks) {
+          if (!current()) return;
+          if (!writableProfile(profileId))
+            throw new Error("账号状态已变化，请刷新账号后重试。");
+          const data = await api("/jobs", { method: "POST", body: chunk.body });
+          if (!current()) return;
+          const requested = new Set(chunk.urls);
+          const confirmed = new Set();
+          for (const job of Array.isArray(data.jobs) ? data.jobs : []) {
+            if (
+              job.profile_id !== profileId ||
+              typeof job.source_url !== "string"
+            )
+              continue;
+            try {
+              const url = normalizeImportUrl(job.source_url);
+              if (requested.has(url)) confirmed.add(url);
+            } catch {
+              /* Unrecognized responses must never discard retryable input. */
+            }
+          }
+          batch.confirmed += confirmed.size;
+          removeConfirmedInput(batch, confirmed);
+          showImportProgress(batch, "正在提交，已入队任务会在后台依次处理。");
+          if (confirmed.size !== chunk.urls.length)
+            throw new Error(
+              "服务器未确认本批全部链接入队，请重试输入框中保留的链接。",
+            );
+        }
+        showImportProgress(batch, "全部已入队，关闭页面后也会继续依次处理。");
+        toast("全部链接已入队，关闭页面后也会继续处理。");
+      } catch (error) {
+        if (!current()) return;
+        showImportProgress(
+          batch,
+          "提交已暂停，尚未确认入队的链接已保留，可再次提交。",
+        );
+        $("import-error").textContent = error.message;
+      } finally {
+        if (state.importBatch === batch) {
+          state.importBatch = null;
+          state.importing = false;
+          if (!current() && state.sessionVersion === sessionVersion) {
+            if (state.selected === profileId)
+              showImportProgress(
+                batch,
+                "提交已暂停，尚未确认入队的链接已保留。",
+              );
+            else $("import-progress").textContent = "";
+          }
+          renderProfiles();
+        }
+      }
+      if (current())
+        await loadHistory().catch(() => {
+          if (current())
+            toast(
+              "已确认入队的任务会继续处理，但记录刷新失败，请刷新记录查看。",
+            );
+        });
     },
     "import-error",
-  ).finally(() => {
-    state.importing = false;
-    updateDestination();
-  });
+  );
 });
 for (const b of document.querySelectorAll("[data-filter]"))
   b.addEventListener("click", () => {
@@ -1004,7 +1238,9 @@ setInterval(() => {
     state.authenticated &&
     state.selected &&
     document.visibilityState === "visible" &&
-    state.jobs.some((j) => !finished.has(j.stage))
+    (state.jobs.some((j) => !finished.has(j.stage)) ||
+      (state.queueProfile === state.selected &&
+        (state.queue?.queued > 0 || state.queue?.running > 0)))
   )
     loadHistory().catch((error) => toast(error.message));
 }, 4000);
